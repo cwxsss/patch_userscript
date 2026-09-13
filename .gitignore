@@ -17,6 +17,12 @@ _*.log
 # 改址工具的输出（由 tools/patch_userscript.py 按需生成）
 dist/
 
+# 密钥：绝对不能提交
+.api_key
+config.json
+.env
+*.pem
+
 # 编辑器 / 系统
 .idea/
 .vscode/

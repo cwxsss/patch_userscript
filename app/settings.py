@@ -27,9 +27,29 @@ DEFAULTS: dict = {
         "log_level": "info",
     },
     "auth": {
-        # 是否需要请求头 X-Api-Key。自建内网使用可保持 False。
+        # ---- 第 1 层：共享密钥（真正的鉴权）----
+        # 需要请求头 X-Api-Key（或 ?api_key=）。脚本原生不发这个头，
+        # 由 tools/patch_userscript.py --api-key 注入到脚本里，所以只有你自己的
+        # 脚本副本持有密钥。留空 + require_api_key=true 会导致所有请求被拒。
         "require_api_key": False,
         "api_key": "",
+        # ---- 第 2 层：直连过滤 ----
+        # 要求请求头 X-Captcha-Protected: 1。油猴脚本对非 localhost 的后端地址
+        # 会自动带上这个头（源码里的 Fe="X-Captcha-Protected"），能挡掉 curl /
+        # 扫描器 / 直接拿接口脚本刷的人。它不是密钥（明文写在脚本里），只是廉价过滤。
+        "require_protected_header": False,
+        # ---- 本机豁免 ----
+        # 来自环回/内网网段的请求（按**不可伪造的** TCP 对端判断）免密钥，
+        # 方便 SSH 上去 curl 自测、跑运维脚本。公网请求不受影响。
+        # 注意：如果以后把本服务挂到本机反向代理后面，所有请求都会变成 127.0.0.1，
+        # 这个开关就等于关闭鉴权 —— 那时务必改成 false。
+        "trust_localhost": True,
+        # 是否信任 X-Forwarded-For / X-Real-IP 作为限额计数的 IP。
+        # 默认 false：这两个头可以随便伪造，开了就能换 IP 绕过每日限额。
+        # 只有服务确实在可信反向代理之后才该打开。
+        "trust_proxy_headers": False,
+        # /admin/* 的独立密钥。留空则复用 api_key。
+        "admin_key": "",
         # 每个 IP 每日识别次数上限，0 = 不限。油猴脚本作者原服务是 50。
         "daily_limit_per_ip": 0,
         # 命中这些 host 的识别请求额外限流（与原脚本"敏感站点"策略对应）

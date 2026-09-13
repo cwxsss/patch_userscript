@@ -7,11 +7,13 @@
   "auth": {
     "require_api_key": false,
     "api_key": "",
-    "daily_limit_per_ip": 0,
+    "daily_limit_per_ip": 300,
     "sensitive_host_rate_limit": {
       "window_seconds": 60,
       "max_requests": 3
-    }
+    },
+    "require_protected_header": false,
+    "admin_key": ""
   },
   "storage": {
     "enabled": true,

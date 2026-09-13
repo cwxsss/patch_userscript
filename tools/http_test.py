@@ -21,6 +21,9 @@ os.chdir(ROOT)
 from tools.selftest import make_captcha, make_slider
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:7070"
+# 服务端开了鉴权时，用第二个参数或环境变量传密钥：
+#   python tools/http_test.py http://1.2.3.4:7070 <api-key>
+API_KEY = (sys.argv[2] if len(sys.argv) > 2 else os.environ.get("CAPTCHA_API_KEY", "")).strip()
 PASS: list[str] = []
 FAIL: list[str] = []
 
@@ -33,10 +36,16 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def call(method: str, path: str, payload=None, timeout: int = 60):
+def call(method: str, path: str, payload=None, timeout: int = 60, auth: bool = True):
+    """auth=True 时按油猴脚本的方式带鉴权头；auth=False 用于验证鉴权是否真的生效。"""
     url = BASE.rstrip("/") + path
     data = None
     headers = {"User-Agent": "Tampermonkey/5.0", "Accept": "application/json"}
+    if auth:
+        # 油猴脚本对非 localhost 后端会自动带上这个头（源码 Fe="X-Captcha-Protected"）
+        headers["X-Captcha-Protected"] = "1"
+        if API_KEY:
+            headers["X-Api-Key"] = API_KEY
     if payload is not None:
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
@@ -173,9 +182,31 @@ def main() -> int:
 
     print("\n9. 管理接口")
     st, body = call("GET", "/admin/stats")
-    check("GET /admin/stats", st == 200 and envelope(body))
+    check("GET /admin/stats", st == 200 and envelope(body), f"HTTP {st} {str(body)[:90]}")
     if body.get("ok"):
         print(f"       {json.dumps(body['data'], ensure_ascii=False)[:220]}")
+
+    print("\n10. 鉴权")
+    if API_KEY:
+        st, body = call("POST", "/captcha", {"image": b64, "meta": meta}, auth=False)
+        code = str(body.get("error", {}).get("code") or "")
+        check("不带密钥 -> 被拒", body.get("ok") is False,
+              f"HTTP {st} code={code!r}")
+        check("拒绝时有 error.code（脚本靠它判定）", bool(code))
+        check("拒绝时带上 notice.displayMessage（用户能看到提示）",
+              isinstance(body.get("notice"), dict)
+              and bool(body["notice"].get("displayMessage") or body["notice"].get("message")),
+              str(body.get("notice"))[:90])
+        st, body = call("POST", "/captcha", {"image": b64, "meta": meta})
+        check("带正确密钥 -> 放行", body.get("ok") is True, f"HTTP {st} {str(body)[:90]}")
+
+    # 伪造 XFF 不应该能绕过每日限额
+    print("     —— X-Forwarded-For 伪造检查")
+    st1, b1 = call("POST", "/captcha", {"image": b64, "meta": meta})
+    print(f"        正常请求: ok={b1.get('ok')}")
+    print("        说明：限额按 TCP 对端 IP 计数，服务端 trust_proxy_headers=false 时 XFF 无效")
+    if not API_KEY:
+        print("     (未提供 API Key，跳过强制鉴权项；加第二个参数或 CAPTCHA_API_KEY 环境变量)")
 
     print("\n" + "=" * 62)
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

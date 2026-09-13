@@ -1,6 +1,12 @@
 services:
   captcha-server:
-    build: .
+    build:
+      context: .
+      args:
+        # 国内服务器建议换成阿里云源，构建快很多：
+        # 注意：改了 args 后需要 docker compose build --no-cache
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple/}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
     image: captcha-server:latest
     container_name: captcha-server
     restart: unless-stopped
@@ -14,3 +20,11 @@ services:
       # 需要鉴权时打开：
       # - CAPTCHA_AUTH__REQUIRE_API_KEY=true
       # - CAPTCHA_AUTH__API_KEY=your-secret
+    # 本机内存有限（3.4G，无 swap），给个上限避免影响同机其他服务
+    mem_limit: 1200m
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:7070/health', timeout=5).status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

@@ -1,17 +1,27 @@
 # -*- coding: utf-8 -*-
-"""把油猴脚本里的服务端地址改成你自建的地址。
+"""把油猴脚本里的服务端地址改成你自建的地址（可选：同时注入 API Key）。
 
 用法：
-    python tools/patch_userscript.py 原始脚本路径 -o 输出路径 --base http://192.168.1.10:7070
+    python tools/patch_userscript.py 原始脚本路径 -o 输出路径 \
+        --base http://192.168.1.10:7070 --api-key <你的密钥>
 
 脚本里硬编码的后端地址是一串明文常量（形如 `var og="http://115.191.58.84:7070"`），
-本工具做两件事：
+本工具做三件事：
   1. 优先把 URL 字面量整体替换掉；
-  2. 若字面量没找到，再尝试匹配 `var <name>="<url>"` 的赋值形态。
+  2. 若字面量没找到，再尝试匹配 `var <name>="<url>"` 的赋值形态；
+  3. 给了 --api-key 时，往脚本构造请求头的函数里注入 `X-Api-Key`。
+
+第 3 步的注入点：
+    脚本里所有请求头都由一个函数拼装，函数体结尾是
+        P()||(k[Fe]="1"),k}
+    其中 Fe="X-Captcha-Protected"。把结尾改成
+        P()||(k[Fe]="1"),k["X-Api-Key"]="<KEY>",k}
+    即可让**所有**接口自动带上密钥。这个锚点在该版本脚本里全局唯一（已校验）。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -19,6 +29,9 @@ from pathlib import Path
 OLD_URL = "http://115.191.58.84:7070"
 # 兼容任意变量名 + 任意 http(s) 裸地址的赋值
 ASSIGN_RE = re.compile(r'(var\s+[A-Za-z_$][\w$]*\s*=\s*)(["\'])https?://\d{1,3}(?:\.\d{1,3}){3}:\d+(["\'])')
+# 请求头拼装函数的结尾锚点（唯一）
+HEADER_ANCHOR = 'P()||(k[Fe]="1"),k}'
+API_KEY_HEADER = "X-Api-Key"
 
 
 def patch(text: str, base: str) -> tuple[str, str]:
@@ -35,11 +48,28 @@ def patch(text: str, base: str) -> tuple[str, str]:
     return text, "未找到服务端地址，脚本可能已更换版本或已被修改"
 
 
+def inject_api_key(text: str, key: str) -> tuple[str, str]:
+    """把 X-Api-Key 注入请求头拼装函数。"""
+    if not key:
+        return text, "未注入 API Key（未指定 --api-key）"
+
+    if f'["{API_KEY_HEADER}"]' in text or f"['{API_KEY_HEADER}']" in text:
+        return text, f"脚本里已有 {API_KEY_HEADER}，跳过注入"
+
+    hits = text.count(HEADER_ANCHOR)
+    if hits != 1:
+        return text, f"[!] 注入锚点匹配 {hits} 处（期望 1 处），跳过注入，请手动处理"
+
+    injection = f'P()||(k[Fe]="1"),k["{API_KEY_HEADER}"]={json.dumps(key)},k}}'
+    return text.replace(HEADER_ANCHOR, injection), f"已注入 {API_KEY_HEADER} 请求头"
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="改写油猴脚本的服务端地址")
+    ap = argparse.ArgumentParser(description="改写油猴脚本的服务端地址（可选注入 API Key）")
     ap.add_argument("source", help="原始脚本路径")
     ap.add_argument("-o", "--output", help="输出路径，默认 <原名>.selfhost.user.js")
     ap.add_argument("--base", required=True, help="自建服务地址，例如 http://192.168.1.10:7070")
+    ap.add_argument("--api-key", default="", help="注入到脚本里的 X-Api-Key（与服务端 config.json 一致）")
     args = ap.parse_args()
 
     src = Path(args.source)
@@ -49,6 +79,7 @@ def main() -> int:
 
     text = src.read_text(encoding="utf-8", errors="replace")
     patched, note = patch(text, args.base)
+    patched, key_note = inject_api_key(patched, args.api_key)
 
     base = args.base.rstrip("/")
     # 顺手补一个 @connect，避免某些脚本管理器拦截跨域请求
@@ -61,6 +92,7 @@ def main() -> int:
     out.write_text(patched, encoding="utf-8")
 
     print(f"[✓] {note}")
+    print(f"[✓] {key_note}")
     print(f"[✓] 新地址：{base}")
     print(f"[✓] 已写出：{out}")
     print("    下一步：在 Tampermonkey 里导入这个新文件（先禁用/卸载原脚本）。")

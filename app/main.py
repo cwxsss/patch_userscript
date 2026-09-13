@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
 from typing import Any
 
@@ -16,7 +17,7 @@ from fastapi.responses import JSONResponse, Response
 
 from . import ocr_engine, settings, slider_engine, store
 from .imageutil import ImageDecodeError, to_bytes
-from .protocol import as_dict, client_ip, fail, ok, q
+from .protocol import as_dict, client_ip, fail, is_private_ip, ok, peer_ip, q
 
 app = FastAPI(
     title="Self-hosted Captcha Recognition Backend",
@@ -47,6 +48,23 @@ def _startup() -> None:
         print(f"[startup] 警告：滑块识别不可用（{slider_engine.unavailable_reason()}）")
     if not ocr_engine.available():
         print(f"[startup] 警告：普通验证码识别不可用（{ocr_engine.unavailable_reason()}）")
+    _log_auth_posture()
+
+
+def _log_auth_posture() -> None:
+    """把鉴权配置打印出来，配置改了不用猜到底生效没有。"""
+    cfg = settings.get()["auth"]
+    layers = []
+    if cfg.get("require_protected_header"):
+        layers.append("X-Captcha-Protected")
+    if cfg.get("require_api_key"):
+        layers.append("X-Api-Key")
+    print(f"[startup] 鉴权: {' + '.join(layers) if layers else '未启用（裸奔！）'}")
+    if cfg.get("trust_localhost"):
+        print("[startup] 鉴权: 环回/内网请求免密钥（trust_localhost=true）")
+    if cfg.get("trust_proxy_headers"):
+        print("[startup] 警告：信任 X-Forwarded-For 作为限额 IP，该头可被伪造")
+    print(f"[startup] 每日限额: {int(cfg.get('daily_limit_per_ip') or 0) or '不限'} 次/IP")
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +82,29 @@ async def read_json(request: Request) -> dict:
 
 
 def guard(request: Request) -> str:
-    """鉴权 + 每日限额。返回客户端 IP。"""
-    cfg = settings.get()["auth"]
-    ip = client_ip(request)
+    """鉴权 + 每日限额。返回用于限额计数的客户端 IP。
 
-    if cfg.get("require_api_key"):
-        key = request.headers.get("x-api-key") or q(request, "api_key")
-        if key != str(cfg.get("api_key") or ""):
-            raise PermissionError("API_KEY_INVALID")
+    鉴权是两层的，各自可单独关闭：
+      1. require_protected_header —— 要求 `X-Captcha-Protected: 1`。
+         油猴脚本对非 localhost 的后端地址会自动带上（源码 Fe="X-Captcha-Protected"），
+         所以这一层不挡正常脚本，只挡 curl / 扫描器 / 直接打接口的人。
+      2. require_api_key —— 要求 `X-Api-Key`（或 `?api_key=`）等于配置的密钥。
+         脚本原生不发这个头，密钥由 tools/patch_userscript.py --api-key 注入，
+         因此只有你自己的脚本副本持有它。
+
+    trust_localhost 打开时，来自环回/内网网段的请求免密钥 —— 判定用的是
+    **不可伪造的 TCP 对端**（peer_ip），公网请求拿不到这个豁免。
+    """
+    cfg = settings.get()["auth"]
+    ip = _client_ip(request)
+
+    if not _is_trusted_local(request):
+        if cfg.get("require_protected_header"):
+            if request.headers.get("x-captcha-protected") != "1":
+                raise PermissionError("PROTECTED_HEADER_REQUIRED")
+        if cfg.get("require_api_key"):
+            if not _key_matches(request, cfg.get("api_key")):
+                raise PermissionError("API_KEY_INVALID")
 
     limit = int(cfg.get("daily_limit_per_ip") or 0)
     if limit > 0 and store.quota_peek(ip) >= limit:
@@ -80,9 +113,58 @@ def guard(request: Request) -> str:
     return ip
 
 
+def admin_guard(request: Request) -> str:
+    """管理接口鉴权：本机/内网放行，否则必须带 admin_key（留空则复用 api_key）。"""
+    cfg = settings.get()["auth"]
+    if _is_trusted_local(request):
+        return peer_ip(request)
+    key = str(cfg.get("admin_key") or cfg.get("api_key") or "")
+    if key and _key_matches(request, key):
+        return peer_ip(request)
+    raise PermissionError("ADMIN_KEY_INVALID")
+
+
+def _client_ip(request: Request) -> str:
+    """限额计数用的 IP。默认只认 TCP 对端，避免 XFF 伪造绕过每日限额。"""
+    cfg = settings.get()["auth"]
+    return client_ip(request, trust_proxy=bool(cfg.get("trust_proxy_headers")))
+
+
+def _is_trusted_local(request: Request) -> bool:
+    cfg = settings.get()["auth"]
+    return bool(cfg.get("trust_localhost")) and is_private_ip(peer_ip(request))
+
+
+def _key_matches(request: Request, expected: Any) -> bool:
+    """恒定时间比较，避免时序侧信道。"""
+    expected = str(expected or "")
+    if not expected:
+        return False
+    given = str(request.headers.get("x-api-key") or q(request, "api_key") or "")
+    return secrets.compare_digest(given, expected)
+
+
+# 鉴权失败时下发的提示。key 故意不用 "rate_limited" —— 脚本见到那个 key
+# 会把当前 host 标记为已限流，属于副作用，鉴权场景不需要。
+_AUTH_NOTICE = {
+    "key": "auth_required",
+    "message": "该识别服务需要授权，请使用配套的油猴脚本",
+    "displayMessage": "该识别服务需要授权，请使用配套的油猴脚本",
+}
+
+
 def _guard_error(exc: Exception):
     if isinstance(exc, PermissionError):
-        return fail("API_KEY_INVALID", "API Key 无效或缺失")
+        code = str(exc) or "UNAUTHORIZED"
+        if code == "API_KEY_INVALID":
+            msg = "API Key 无效或缺失，请在脚本配置中填入正确的密钥"
+        elif code == "PROTECTED_HEADER_REQUIRED":
+            msg = "拒绝直连调用：请使用配套的油猴脚本访问"
+        elif code == "ADMIN_KEY_INVALID":
+            msg = "管理接口需要管理员密钥"
+        else:
+            msg = "未授权"
+        return fail(code, msg, notice=_AUTH_NOTICE)
     if isinstance(exc, RuntimeError) and "DAILY_LIMIT_EXCEEDED" in str(exc):
         return fail("DAILY_LIMIT_EXCEEDED", "今日识别次数已达上限，请明天再试")
     return fail("GUARD_ERROR", str(exc))
@@ -216,7 +298,7 @@ async def captcha(request: Request):
 # ---------------------------------------------------------------------------
 @app.post("/captcha-feedback")
 async def captcha_feedback(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     meta = as_dict(body.get("meta"))
     store.log_feedback(ip, str(meta.get("host") or ""), body)
@@ -307,7 +389,7 @@ def slide_trajectory_config(request: Request):
 
 @app.post("/api/slide/trajectory/report")
 async def slide_trajectory_report(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     store.log_slide_sample(ip, "trajectory", body)
     return ok({"accepted": True})
@@ -315,7 +397,7 @@ async def slide_trajectory_report(request: Request):
 
 @app.post("/api/slide/human-sample/report")
 async def slide_human_sample_report(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     store.log_slide_sample(ip, "human", body)
     return ok({"ok": True, "saved": True, "accepted": True})
@@ -330,28 +412,28 @@ def _binding_ack():
 
 @app.post("/api/normal/shared-binding/report")
 async def normal_binding_report(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     store.log_binding(ip, "normal", "report", await read_json(request))
     return _binding_ack()
 
 
 @app.post("/api/normal/shared-binding/event")
 async def normal_binding_event(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     store.log_binding(ip, "normal", "event", await read_json(request))
     return _binding_ack()
 
 
 @app.post("/api/slide/shared-binding/report")
 async def slide_binding_report(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     store.log_binding(ip, "slide", "report", await read_json(request))
     return _binding_ack()
 
 
 @app.post("/api/slide/shared-binding/event")
 async def slide_binding_event(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     store.log_binding(ip, "slide", "event", await read_json(request))
     return _binding_ack()
 
@@ -405,7 +487,7 @@ def userscript_page_config(request: Request):
 # ---------------------------------------------------------------------------
 @app.post("/api/userscript/events")
 async def userscript_events(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     events = body.get("events")
     if not isinstance(events, list):
@@ -433,7 +515,7 @@ async def userscript_events(request: Request):
 
 @app.post("/api/userscript/event")
 async def userscript_event(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     meta = as_dict(body.get("meta"))
     store.log_event(ip, str(meta.get("host") or ""), str(body.get("event") or ""), body)
@@ -442,7 +524,7 @@ async def userscript_event(request: Request):
 
 @app.post("/api/userscript/trace-upload")
 async def userscript_trace_upload(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     store.log_event(ip, "", "trace-upload", body)
     return ok({"accepted": True})
@@ -450,7 +532,7 @@ async def userscript_trace_upload(request: Request):
 
 @app.post("/api/userscript/identity-sync")
 async def userscript_identity_sync(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     store.log_identity(ip, body)
     return ok({"accepted": True, "status": "ok"})
@@ -458,7 +540,7 @@ async def userscript_identity_sync(request: Request):
 
 @app.post("/api/userscript/suppression-summary")
 async def userscript_suppression_summary(request: Request):
-    ip = client_ip(request)
+    ip = _client_ip(request)
     body = await read_json(request)
     store.log_event(ip, "", "suppression-summary", body)
     return ok({"accepted": True})
@@ -475,15 +557,23 @@ async def quota_code_activate(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# 8. 管理接口
+# 8. 管理接口（需要管理员密钥；本机/内网免密钥）
 # ---------------------------------------------------------------------------
 @app.get("/admin/stats")
 def admin_stats(request: Request):
+    try:
+        admin_guard(request)
+    except Exception as exc:
+        return _guard_error(exc)
     return ok(store.stats())
 
 
 @app.post("/admin/reload")
 def admin_reload(request: Request):
+    try:
+        admin_guard(request)
+    except Exception as exc:
+        return _guard_error(exc)
     settings.reload()
     store.reset_connection()
     store.init()
@@ -493,11 +583,19 @@ def admin_reload(request: Request):
 @app.get("/admin/slider-debug")
 def admin_slider_debug(request: Request):
     """调滑块参数用：POST 图片到 /admin/slider-debug，这里只提示用法。"""
+    try:
+        admin_guard(request)
+    except Exception as exc:
+        return _guard_error(exc)
     return ok({"usage": "POST /admin/slider-debug，body 同 /api/slide/solve，返回叠加了匹配框的 PNG"})
 
 
 @app.post("/admin/slider-debug")
 async def admin_slider_debug_post(request: Request):
+    try:
+        admin_guard(request)
+    except Exception as exc:
+        return _guard_error(exc)
     body = await read_json(request)
     try:
         bg = to_bytes(body.get("backgroundImage"))

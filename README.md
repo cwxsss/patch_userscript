@@ -49,16 +49,73 @@ docker compose logs -f
 ### 方式 C：验证接口（可选）
 
 ```bash
-.venv/Scripts/python tools/http_test.py http://127.0.0.1:7070
+# 开了鉴权的话，第二个参数传密钥（或设环境变量 CAPTCHA_API_KEY）
+.venv/Scripts/python tools/http_test.py http://127.0.0.1:7070 <api-key>
 ```
-会按油猴脚本的请求方式打一遍全部 22 个接口，校验响应信封是否合规。
+会按油猴脚本的请求方式打一整套接口，校验响应信封是否合规，并顺带验证鉴权拦截是否生效。
+不开鉴权时省略第二个参数即可。
 
 ---
 
-## 二、让脚本指向你的服务器
+## 二、开启鉴权（公网部署必做）
+
+服务默认**裸奔** —— 绑在公网上谁扫到都能白嫖。开鉴权只要三步：
+
+```bash
+# 1) 生成密钥并写进 config.json（require_api_key / require_protected_header 一起打开）
+python tools/setup_auth.py
+#    → api_key = <64 位随机串>   （每次执行都不一样）
+
+# 2) 用这个密钥重新生成油猴脚本
+python tools/patch_userscript.py 原始脚本路径 -o dist/自建版.user.js \
+    --base http://47.94.222.106:7070 --api-key <上一步的密钥>
+
+# 3) 重启服务
+docker compose up -d --force-recreate     # 或 python run.py
+```
+
+### 鉴权是怎么做的
+
+两层，各自可单独关：
+
+| 层 | 请求头 | 说明 |
+|---|---|---|
+| 直连过滤 | `X-Captcha-Protected: 1` | **油猴脚本自带**。脚本源码里 `Fe="X-Captcha-Protected"`，只要后端地址不是 localhost 就会带上。挡掉 curl / 扫描器 / 直接打接口的人。 |
+| 共享密钥 | `X-Api-Key: <密钥>` | **脚本原生不发**，由 `patch_userscript.py --api-key` 注入到请求头拼装函数里。所以只有你自己的脚本副本持有它。 |
+
+密钥也可以走查询参数：`?api_key=<密钥>`（方便 curl 调试）。
+
+**本机豁免**：`trust_localhost`（默认 `true`）让环回/内网过来的请求免密钥，方便 SSH 上去
+自己 curl 测试。判定用的是**不可伪造的 TCP 对端地址**，所以公网请求带
+`X-Forwarded-For: 127.0.0.1` 是绕不过去的（已实测）。
+
+> ⚠️ 如果你以后把本服务挂到本机 Nginx/Caddy 后面，所有请求的对端都会变成 `127.0.0.1`，
+> 这个豁免就等于关闭鉴权 —— 那时务必把 `trust_localhost` 改成 `false`。
+
+管理接口 `/admin/*` 用 `admin_key`（留空则复用 `api_key`），同样对本机豁免。
+
+### 顺手修掉的一个坑
+
+原来限额计数直接读 `X-Forwarded-For`，任何人加个 `X-Forwarded-For: 1.2.3.4`
+就能换着 IP 无限刷。现在默认只认 TCP 对端（`trust_proxy_headers: false`），
+只有服务确实在可信反向代理之后才该打开。
+
+### 轮换 / 关闭
+
+```bash
+python tools/setup_auth.py                # 重新生成密钥（旧的立即失效，记得重新生成脚本）
+python tools/setup_auth.py --show         # 查看当前配置
+python tools/setup_auth.py --disable      # 关掉鉴权
+```
+
+密钥存在 `.api_key`（已 gitignore）和服务端 `config.json` 里，**别提交到仓库**。
+
+---
+
+## 三、让脚本指向你的服务器
 
 脚本里后端地址是一个硬编码常量：`var og="http://115.191.58.84:7070"`。
-用自带工具一键改写：
+用自带工具一键改写（配合上面的 `--api-key` 可同时注入密钥）：
 
 ```bash
 python tools/patch_userscript.py 原始脚本路径 -o dist/自建版.user.js \
@@ -68,12 +125,14 @@ python tools/patch_userscript.py 原始脚本路径 -o dist/自建版.user.js \
 - `--base` 填你的服务地址。**局域网自用可填内网 IP；要公网用建议套 Nginx + HTTPS。**
 - 生成的文件在 Tampermonkey 里导入，**先禁用/卸载原脚本**，避免两个同时跑。
 - 工具会自动给脚本头部补一条 `@connect <你的域名>`。
+- 注入原理：脚本所有请求头都由一个函数拼装，函数体结尾是 `P()||(k[Fe]="1"),k}`，
+  工具把它改成 `P()||(k[Fe]="1"),k["X-Api-Key"]="<密钥>",k}`（该锚点全局唯一，注入前会校验）。
 
 > 脚本是 MIT 协议，改造自用完全合规。
 
 ---
 
-## 三、接口契约（逆向自脚本 v7.95）
+## 四、接口契约（逆向自脚本 v7.95）
 
 ### 响应信封（所有接口统一）
 
@@ -126,7 +185,7 @@ python tools/patch_userscript.py 原始脚本路径 -o dist/自建版.user.js \
 
 ---
 
-## 四、配置说明（`config.json`）
+## 五、配置说明（`config.json`）
 
 所有字段都可用环境变量覆盖，格式 `CAPTCHA_<段>__<键>`，例如：
 
@@ -138,11 +197,16 @@ CAPTCHA_AUTH__API_KEY=your-secret
 
 ### `auth` —— 鉴权与限流
 
-| 键 | 说明 |
-|---|---|
-| `require_api_key` | 打开后要求请求头 `X-Api-Key`。**公网部署务必打开** |
-| `api_key` | 密钥 |
-| `daily_limit_per_ip` | 每 IP 每日识别上限，`0` = 不限（原私服是 50） |
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `require_api_key` | `false` | 打开后要求 `X-Api-Key`（或 `?api_key=`）。**公网部署务必打开** |
+| `api_key` | `""` | 共享密钥。用 `tools/setup_auth.py` 生成，别手写弱口令 |
+| `require_protected_header` | `false` | 要求 `X-Captcha-Protected: 1`（油猴脚本自带），挡直连 |
+| `trust_localhost` | `true` | 环回/内网请求免密钥，方便本机运维。挂反代后必须改 `false` |
+| `trust_proxy_headers` | `false` | 是否用 `X-Forwarded-For` 作为限额 IP。**该头可伪造，默认关闭** |
+| `admin_key` | `""` | `/admin/*` 的独立密钥，留空复用 `api_key` |
+| `daily_limit_per_ip` | `0` | 每 IP 每日识别上限，`0` = 不限（原私服是 50） |
+| `sensitive_host_rate_limit` | — | 命中敏感站点时的额外限流窗口 |
 
 ### `ocr` —— 普通验证码
 
@@ -177,7 +241,7 @@ curl -X POST http://127.0.0.1:7070/admin/slider-debug \
 
 ---
 
-## 五、算法说明（为什么这么写）
+## 六、算法说明（为什么这么写）
 
 滑块求解的核心结论（`tools/slider_experiment.py`，4 个缺口位置 × 2 类背景）：
 
@@ -198,25 +262,27 @@ curl -X POST http://127.0.0.1:7070/admin/slider-debug \
 
 ---
 
-## 六、目录结构
+## 七、目录结构
 
 ```
 captcha-server/
 ├── app/
-│   ├── main.py            # FastAPI 路由：全部 22 个接口
+│   ├── main.py            # FastAPI 路由：全部 22 个接口 + 鉴权
 │   ├── settings.py        # 配置加载（config.json + 环境变量覆盖）
-│   ├── protocol.py        # 响应信封 / 客户端 IP
+│   ├── protocol.py        # 响应信封 / 客户端 IP（TCP 对端 vs 代理头）
 │   ├── ocr_engine.py      # ddddocr 封装 + 算术验证码
 │   ├── slider_engine.py   # 滑块缺口求解
 │   ├── imageutil.py       # dataURL / base64 解码
 │   └── store.py           # SQLite 落库（识别日志/反馈/样本/埋点/绑定）
 ├── tools/
 │   ├── selftest.py            # 离线自检（18 项）
-│   ├── http_test.py           # HTTP 端到端测试（33 项）
-│   ├── patch_userscript.py    # 改写脚本服务端地址
+│   ├── http_test.py           # HTTP 端到端测试（37 项，含鉴权）
+│   ├── setup_auth.py          # 生成/轮换 API Key，开关鉴权
+│   ├── patch_userscript.py    # 改写脚本地址（可注入 X-Api-Key）
 │   ├── slider_debug.py        # 滑块策略调试
 │   └── slider_experiment.py   # 滑块策略对比实验
 ├── config.json
+├── .api_key               # 本机生成的密钥（gitignore）
 ├── requirements.txt
 ├── Dockerfile / docker-compose.yml
 └── run.py
@@ -229,19 +295,22 @@ captcha-server/
 
 ---
 
-## 七、安全建议
+## 八、安全建议
 
-1. **不要裸奔公网**。至少打开 `require_api_key`，并且用 Nginx 套一层 HTTPS
-   —— 脚本支持 `https://` 地址，改址时直接传 HTTPS 域名即可。
+1. **不要裸奔公网**。按[第二节](#二开启鉴权公网部署必做)打开鉴权；
+   再进一步就用 Nginx/Caddy 套一层 HTTPS —— 脚本支持 `https://` 地址，
+   改址时直接传 HTTPS 域名即可（记得同时把 `trust_localhost` 改成 `false`）。
 2. **别开 `allow_remote_image_url`**，除非你确实要它去抓远程图片（有 SSRF 风险）。
 3. 落库的埋点/样本包含页面 URL，属于敏感数据，注意磁盘权限与保留周期。
 4. 把 `daily_limit_per_ip` 设成合理值，避免被人当成公共 OCR 接口刷。
-5. 本服务只做「图片 → 文字/距离」的识别，**不代填、不代提交**，
+5. `.api_key` 与 `config.json` 里的密钥**不要提交到 Git**（`.gitignore` 已覆盖）。
+   密钥一旦泄露，跑一次 `tools/setup_auth.py` 换新即可，旧密钥立即失效。
+6. 本服务只做「图片 → 文字/距离」的识别，**不代填、不代提交**，
    也不会读取任何 Cookie —— 这正是相比原私服的隐私优势所在。
 
 ---
 
-## 八、已知限制
+## 九、已知限制
 
 - **滑块不是万能的**：合成样本 100% 命中不代表真实站点 100% 命中。
   不同站点缺口/拼图块的生成方式差异很大，请用 `/admin/slider-debug` 按站点调
@@ -254,7 +323,7 @@ captcha-server/
 
 ---
 
-## 九、合规提醒
+## 十、合规提醒
 
 自动破解验证码会绕过网站的人机校验，可能违反目标站点的用户协议；
 在政务、金融、票务等场景使用还可能触及法律。**请仅用于自己的测试环境或已获授权的场景。**
