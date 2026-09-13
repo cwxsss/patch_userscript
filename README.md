@@ -51,8 +51,12 @@ docker compose logs -f
 ```bash
 # 开了鉴权的话，第二个参数传密钥（或设环境变量 CAPTCHA_API_KEY）
 .venv/Scripts/python tools/http_test.py http://127.0.0.1:7070 <api-key>
+
+# 校验加密层是否与脚本原版一致（给出原脚本路径可做 Node 权威交叉验证）
+.venv/Scripts/python tools/crypto_check.py --js-script <原脚本路径>
 ```
-会按油猴脚本的请求方式打一整套接口，校验响应信封是否合规，并顺带验证鉴权拦截是否生效。
+`http_test` 会按油猴脚本的请求方式打一整套接口（**含加密传输层**），
+校验响应信封是否合规，并顺带验证鉴权拦截是否生效。
 不开鉴权时省略第二个参数即可。
 
 ---
@@ -134,18 +138,72 @@ python tools/patch_userscript.py 原始脚本路径 -o dist/自建版.user.js \
 
 ## 四、接口契约（逆向自脚本 v7.95）
 
+### ⚠️ 请求加密层（最容易踩的坑，没有之一）
+
+**脚本只要发现后端地址不是 `127.0.0.1` / `localhost`，就会把请求加密。**
+
+脚本源码里：
+
+```js
+function Ne(){return !P()}                     // P() = 后端是否本机
+function he(k){ if(!Ne()) return JSON.stringify(k);
+                let y=Z(k); return JSON.stringify(y?{protected:y}:k) }   // POST 体
+function be(k){ ... btoa(JSON.stringify(Z(k))) ... }                      // GET 的 enc
+function nt(k,y){ ... if(Ne()) I.searchParams.set("enc", be(y)) ... }     // 查询串
+```
+
+于是：
+
+- **POST** 请求体变成 `{"protected":{"v":1,"alg":"fnv1a32-xorshift32","nonce":"..","payload":"<base64>"}}`
+- **GET** 的明文字段被**整体替换**成 `?enc=<base64url(JSON(那坨))>`（不是并存！）
+
+算法（纯自研，无第三方库）：
+
+```
+seed  = FNV1a32("ctw_2026_slide_mask_v1" + "|" + nonce)   // 为 0 时取 0xA5A5A5A5
+state = seed
+for i: state = xorshift32(state);  out[i] = data[i] ^ (state & 0xFF)
+```
+
+`app/crypto.py` 已完整实现，`read_json()` 和 `q()` 会自动解码，
+**明文请求体/查询串依然照常工作**（本地 curl、本项目自带测试都走明文）。
+
+用 `tools/crypto_check.py` 校验这一层。带上 `--js-script <原脚本>` 时，它会从真实
+脚本里切出原版 `An/mt/Jr/Z/be` 用 Node 跑一遍真加密，再让 Python 解密比对 ——
+这是权威验证，能确认我们对算法的理解没有偏差（而不是"自己加密自己解"的假通过）。
+
+> 响应方向**不需要**加密：脚本的 `ve()` 只在响应顶层出现 `protected` 时才解包，
+> 没有就直接当普通信封用。所以后端返回明文信封即可。
+
 ### 响应信封（所有接口统一）
 
 ```jsonc
 // 成功
 { "ok": true, "data": { ... } }
 // 失败
-{ "ok": false, "error": { "code": "XXX", "message": "给人看的说明" } }
+{ "ok": false, "error": { "code": "XXX", "message": "给人看的说明" },
+  "notice": { "key": "auth_required", "displayMessage": "弹给用户看的提示" } }  // notice 可选
 ```
 
 脚本侧会用 `ok===true && data.value` 之类的判断，**字段名必须是这些**，否则会报
 `Unknown response structure`。注意即使业务失败也要用 **HTTP 200** 返回 `ok:false`
 （只有额度码接口例外，脚本靠 404/405 判断"服务端不支持"）。
+
+`notice` 在**信封顶层**（与 `ok`/`error` 平级）。脚本会取
+`notice.displayMessage || notice.message` 弹提示；`notice.key` 为 `"rate_limited"`
+时会把该 host 标记为已限流，自定义场景别用这个 key。
+
+### 请求头
+
+脚本每发一个请求都会带（由单一函数 `Le()` 拼装）：
+
+| 头 | 说明 |
+|---|---|
+| `X-Captcha-Client-Version` | 脚本版本，如 `7.95` |
+| `X-Captcha-Language` | 语言 |
+| `X-Captcha-Protected: 1` | **后端非本机时必带**，可用来挡直连 |
+| `X-Captcha-Visit-Id` / `Flow-Id` / `Popup-Id` / `Attempt-Id` / `Request-Id` / `Event-Id` | 链路追踪 |
+| `X-Api-Key` | 脚本**原生不带**，由 `patch_userscript.py --api-key` 注入 |
 
 ### 接口清单
 
@@ -180,6 +238,8 @@ python tools/patch_userscript.py 原始脚本路径 -o dist/自建版.user.js \
 3. **`/api/userscript/page-config` 不要下发无效的 `slideTrajectory`**，
    一旦字段存在但不合法，前端会判定整个配置无效并丢弃。
 4. **`/api/userscript/config` 的 `features` / `rules` / `interactionNotices` 必须是对象**。
+5. **请求是加密的**（见上一节）。只按明文契约写后端的话，本机自测全过、一上公网就
+   `图片字段为空` —— 因为脚本发过来的是 `{"protected": ...}`，后端读不到 `image`。
 5. **错误码 `USERSCRIPT_UPDATE_REQUIRED`** 是脚本的"强制升级"开关，
    返回它会让脚本停止一切请求 —— 自建服务里千万别用。
 
@@ -269,19 +329,22 @@ captcha-server/
 ├── app/
 │   ├── main.py            # FastAPI 路由：全部 22 个接口 + 鉴权
 │   ├── settings.py        # 配置加载（config.json + 环境变量覆盖）
-│   ├── protocol.py        # 响应信封 / 客户端 IP（TCP 对端 vs 代理头）
+│   ├── protocol.py        # 响应信封 / 客户端 IP / 查询参数（含 ?enc= 解码）
+│   ├── crypto.py          # ★ 脚本的请求加密层（fnv1a32 + xorshift32）
 │   ├── ocr_engine.py      # ddddocr 封装 + 算术验证码
 │   ├── slider_engine.py   # 滑块缺口求解
 │   ├── imageutil.py       # dataURL / base64 解码
 │   └── store.py           # SQLite 落库（识别日志/反馈/样本/埋点/绑定）
 ├── tools/
 │   ├── selftest.py            # 离线自检（18 项）
-│   ├── http_test.py           # HTTP 端到端测试（37 项，含鉴权）
+│   ├── http_test.py           # HTTP 端到端测试（48 项，含鉴权与加密层）
+│   ├── crypto_check.py        # 校验加密层与脚本原版是否一致（可 Node 交叉验证）
 │   ├── setup_auth.py          # 生成/轮换 API Key，开关鉴权
 │   ├── patch_userscript.py    # 改写脚本地址（可注入 X-Api-Key）
 │   ├── slider_debug.py        # 滑块策略调试
 │   └── slider_experiment.py   # 滑块策略对比实验
-├── config.json
+├── config.json            # 实际配置（含密钥，gitignore）
+├── config.example.json    # 配置模板
 ├── .api_key               # 本机生成的密钥（gitignore）
 ├── requirements.txt
 ├── Dockerfile / docker-compose.yml

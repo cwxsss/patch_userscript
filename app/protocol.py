@@ -12,6 +12,8 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from . import crypto
+
 
 def ok(data: Any = None) -> dict:
     """成功信封。data 必须能 JSON 序列化。"""
@@ -84,5 +86,34 @@ def as_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def decrypted_params(request: Request) -> dict:
+    """查询参数，兼容油猴脚本的加密形式。
+
+    脚本对**非本机**后端会用 `nt()` 构造查询串：把原本的明文字段整体加密成一个
+    `?enc=<base64url>`，**替换掉**而不是并存。所以这里解出来后要作为主来源。
+    普通明文查询串依然照常工作。
+    """
+    cached = getattr(request.state, "_decoded_params", None)
+    if isinstance(cached, dict):
+        return cached
+
+    params = {k: v for k, v in request.query_params.items()}
+    token = request.query_params.get("enc")
+    if token:
+        inner = crypto.decrypt_query(token)
+        if isinstance(inner, dict):
+            merged = dict(inner)
+            # 明文参数优先级更高（便于本地用 ?enc=...&host=... 手工调试）
+            merged.update({k: v for k, v in params.items() if k != "enc"})
+            params = merged
+
+    try:
+        request.state._decoded_params = params
+    except Exception:
+        pass
+    return params
+
+
 def q(request: Request, name: str, default: str = "") -> str:
-    return str(request.query_params.get(name, default) or "").strip()
+    """读查询参数（自动兼容 ?enc= 加密形式）。"""
+    return str(decrypted_params(request).get(name, default) or "").strip()

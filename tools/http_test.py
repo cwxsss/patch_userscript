@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """HTTP 端到端测试：完全按油猴脚本的方式请求自建后端。
 
-    python tools/http_test.py [base_url]
+    python tools/http_test.py [base_url] [api_key]
+
+服务端开了鉴权时把密钥作为第二个参数传入（或设 CAPTCHA_API_KEY）。
+注意：脚本对**非本机**后端会把请求加密（见 app/crypto.py），
+本测试第 11 节专门覆盖这条加密路径。
 """
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -18,7 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
-from tools.selftest import make_captcha, make_slider
+from app import crypto  # noqa: E402
+from tools.selftest import make_captcha, make_slider  # noqa: E402
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:7070"
 # 服务端开了鉴权时，用第二个参数或环境变量传密钥：
@@ -36,9 +42,20 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def call(method: str, path: str, payload=None, timeout: int = 60, auth: bool = True):
-    """auth=True 时按油猴脚本的方式带鉴权头；auth=False 用于验证鉴权是否真的生效。"""
+def call(method: str, path: str, payload=None, timeout: int = 60, auth: bool = True,
+         encrypt: bool = False, params: dict | None = None):
+    """按油猴脚本的方式请求。
+
+    auth=False     -> 不带鉴权头，用于验证鉴权是否真的生效
+    encrypt=True   -> 按脚本对**非本机**后端的行为，加密请求体 / 查询串
+    """
     url = BASE.rstrip("/") + path
+    if params:
+        if encrypt:
+            url += "?enc=" + crypto.encode_query_token(params)
+        else:
+            url += "?" + urllib.parse.urlencode(params)
+
     data = None
     headers = {"User-Agent": "Tampermonkey/5.0", "Accept": "application/json"}
     if auth:
@@ -47,7 +64,8 @@ def call(method: str, path: str, payload=None, timeout: int = 60, auth: bool = T
         if API_KEY:
             headers["X-Api-Key"] = API_KEY
     if payload is not None:
-        data = json.dumps(payload).encode()
+        obj = crypto.wrap_protected(payload) if encrypt else payload
+        data = json.dumps(obj, ensure_ascii=False).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -207,6 +225,42 @@ def main() -> int:
     print("        说明：限额按 TCP 对端 IP 计数，服务端 trust_proxy_headers=false 时 XFF 无效")
     if not API_KEY:
         print("     (未提供 API Key，跳过强制鉴权项；加第二个参数或 CAPTCHA_API_KEY 环境变量)")
+
+    print("\n11. 加密传输层（脚本对非本机后端的真实走法）")
+    st, body = call("POST", "/captcha", {"image": b64, "quotaCode": "", "meta": meta}, encrypt=True)
+    check("加密体 {protected:...} 能被解开并识别", body.get("ok") is True, str(body)[:120])
+    if body.get("ok"):
+        print(f"       value={body['data'].get('value')!r} engine={body['data'].get('engine')!r}")
+
+    st, body = call("GET", "/api/slide/shared-binding", encrypt=True,
+                    params={"host": "example.com", "pathname": "/login"})
+    check("加密查询串 ?enc= 能被解开", st == 200 and envelope(body), f"HTTP {st} {str(body)[:100]}")
+
+    st, body = call("POST", "/captcha",
+                    {"image": b64, "meta": {**meta, "title": "中文·标题😀", "pad": "x" * 3000}},
+                    encrypt=True)
+    check("加密体含中文/emoji/长 base64", body.get("ok") is True, str(body)[:110])
+
+    for name, bad in [
+        ("protected 非对象", {"protected": "abc"}),
+        ("缺 nonce", {"protected": {"v": 1, "alg": crypto.ALG, "payload": "AAAA"}}),
+        ("payload 乱码", {"protected": {"v": 1, "alg": crypto.ALG,
+                                        "nonce": "00" * 8, "payload": "!!!"}}),
+    ]:
+        st, body = call("POST", "/captcha", bad)
+        check(f"坏密文（{name}）优雅报错",
+              body.get("ok") is False and isinstance(body.get("error", {}).get("code"), str),
+              str(body)[:100])
+
+    for path, payload in [
+        ("/api/userscript/suppression-summary", {"summaries": []}),
+        ("/api/userscript/quota-code/activate", {"quotaCode": "x"}),
+        ("/api/normal/shared-binding/report", {"host": "example.com", "accepted": True}),
+        ("/api/slide/shared-binding/report", {"host": "example.com", "accepted": True}),
+        ("/api/slide/shared-binding/event", {"host": "example.com", "event": "x"}),
+    ]:
+        st, body = call("POST", path, payload, encrypt=True)
+        check(f"加密 POST {path}", body.get("ok") is True, str(body)[:100])
 
     print("\n" + "=" * 62)
     print(f"通过 {len(PASS)} 项，失败 {len(FAIL)} 项")

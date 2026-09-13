@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from . import ocr_engine, settings, slider_engine, store
+from . import crypto, ocr_engine, settings, slider_engine, store
 from .imageutil import ImageDecodeError, to_bytes
 from .protocol import as_dict, client_ip, fail, is_private_ip, ok, peer_ip, q
 
@@ -71,14 +71,25 @@ def _log_auth_posture() -> None:
 # 通用依赖
 # ---------------------------------------------------------------------------
 async def read_json(request: Request) -> dict:
+    """读取 JSON 请求体。
+
+    油猴脚本对**非本机**后端会把整个请求体包一层自研加密壳：
+        {"protected": {"v":1,"alg":"fnv1a32-xorshift32","nonce":"..","payload":".."}}
+    这里自动解开；明文请求体（本地调试、curl、本项目自带测试）照常支持。
+    """
     try:
         raw = await request.body()
         if not raw:
             return {}
         data = json.loads(raw.decode("utf-8", "replace"))
-        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+    if not isinstance(data, dict):
+        return {}
+    inner = crypto.unwrap_protected(data)
+    if isinstance(inner, dict):
+        return inner
+    return data
 
 
 def guard(request: Request) -> str:
