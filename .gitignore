@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# 运行期数据（识别日志、埋点、样本）
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 日志
+*.log
+_*.log
+
+# 改址工具的输出（由 tools/patch_userscript.py 按需生成）
+dist/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+services:
+  captcha-server:
+    build: .
+    image: captcha-server:latest
+    container_name: captcha-server
+    restart: unless-stopped
+    ports:
+      - "7070:7070"
+    volumes:
+      - ./config.json:/srv/config.json:ro
+      - ./data:/srv/data
+    environment:
+      - TZ=Asia/Shanghai
+      # 需要鉴权时打开：
+      # - CAPTCHA_AUTH__REQUIRE_API_KEY=true
+      # - CAPTCHA_AUTH__API_KEY=your-secret

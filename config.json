@@ -1,0 +1,61 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 7070,
+    "log_level": "info"
+  },
+  "auth": {
+    "require_api_key": false,
+    "api_key": "",
+    "daily_limit_per_ip": 0,
+    "sensitive_host_rate_limit": {
+      "window_seconds": 60,
+      "max_requests": 3
+    }
+  },
+  "storage": {
+    "enabled": true,
+    "sqlite_path": "data/captcha.db",
+    "store_samples": true,
+    "store_events": true
+  },
+  "ocr": {
+    "provider": "ddddocr",
+    "arithmetic": true,
+    "beta_model": false,
+    "allow_remote_image_url": false
+  },
+  "slider": {
+    "method": "auto",
+    "gray_score_gate": 0.5,
+    "edge_low": 100,
+    "edge_high": 200,
+    "blur_ksize": 5,
+    "suppress_left_ratio": null,
+    "min_distance": 10,
+    "offset": 0,
+    "output_mode": "display"
+  },
+  "userscript_config": {
+    "config_version": "self-hosted-1",
+    "features": {
+      "slideEnabled": true
+    },
+    "rules": {},
+    "interactionNotices": {}
+  },
+  "page_config": {
+    "cache_ttl_seconds": 3600,
+    "normal_image_denylist": []
+  },
+  "trajectory_config": {
+    "collect_enabled": true,
+    "dispatch_enabled": false,
+    "global_dispatch_enabled": false,
+    "max_attempts_per_popup": 3,
+    "config_version": "self-hosted-1",
+    "templates": [],
+    "default_template": null
+  },
+  "quota_codes": []
+}
